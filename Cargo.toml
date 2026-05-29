@@ -2,6 +2,12 @@
 name = "cursorflow"
 version = "0.1.0"
 edition = "2024"
+description = "Generate human-like cursor movement trajectories"
+license = "MIT"
+repository = "https://github.com/xth24/cursorflow-rs"
+readme = "README.md"
+keywords = ["cursor", "mouse", "trajectory", "movement"]
+categories = ["simulation"]
 
 [dependencies]
 rand = "0.10"
