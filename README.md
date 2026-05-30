@@ -1,6 +1,7 @@
 # cursorflow
 
 [![Crates.io](https://img.shields.io/crates/v/cursorflow.svg)](https://crates.io/crates/cursorflow)
+[![Crates.io](https://img.shields.io/crates/d/cursorflow.svg)](https://crates.io/crates/cursorflow)
 [![Docs.rs](https://docs.rs/cursorflow/badge.svg)](https://docs.rs/cursorflow)
 [![License](https://img.shields.io/crates/l/cursorflow.svg)](LICENSE)
 
