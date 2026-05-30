@@ -9,6 +9,8 @@ use crate::trajectory::Trajectory;
 
 pub type Point = [f64; 2];
 
+const MAX_SAMPLE_RATE: u32 = 10_000;
+
 fn sub(a: Point, b: Point) -> Point {
     [a[0] - b[0], a[1] - b[1]]
 }
@@ -27,6 +29,14 @@ fn norm(a: Point) -> f64 {
 
 fn sign<R: Rng>(rng: &mut R) -> f64 {
     if rng.random_bool(0.5) { 1.0 } else { -1.0 }
+}
+
+fn finite_positive_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
 }
 
 fn linspace(start: f64, end: f64, n: usize) -> Vec<f64> {
@@ -101,13 +111,12 @@ fn peak_normalize(values: &mut [f64]) {
     }
 }
 
-fn fitts_duration<R: Rng>(
-    distance: f64,
-    diagonal: f64,
-    style: &MovementStyle,
-    rng: &mut R,
-) -> f64 {
-    let rel = distance / diagonal;
+fn fitts_duration<R: Rng>(distance: f64, diagonal: f64, style: &MovementStyle, rng: &mut R) -> f64 {
+    let rel = if distance.is_finite() && diagonal.is_finite() && diagonal > 0.0 {
+        (distance / diagonal).max(0.0)
+    } else {
+        0.0
+    };
     let a = 0.18 + rng.random_range(-0.02..0.02);
     let b = 0.38 + rng.random_range(-0.03..0.03);
     let mut mt = a + b * (1.0 + 12.0 * rel).log2();
@@ -150,7 +159,12 @@ fn sub_movement_profile<R: Rng>(n: usize, style: &MovementStyle, rng: &mut R) ->
 
     for k in 1..style.sub_movement_count {
         let kf = k as f64;
-        let frac = rng.random_range((0.55 + kf * 0.1)..(0.75 + kf * 0.05));
+        let start = 0.55 + kf * 0.1;
+        let end = 0.75 + kf * 0.05;
+        if start >= end {
+            continue;
+        }
+        let frac = rng.random_range(start..end);
         let start_idx = (frac * n as f64) as usize;
         let sub_n = n.saturating_sub(start_idx);
         if sub_n < 4 {
@@ -163,8 +177,24 @@ fn sub_movement_profile<R: Rng>(n: usize, style: &MovementStyle, rng: &mut R) ->
         }
     }
 
+    smooth_velocity_profile(&mut combined, style.jerk_smoothness);
     peak_normalize(&mut combined);
     combined
+}
+
+fn smooth_velocity_profile(values: &mut [f64], smoothness: f64) {
+    if values.len() < 3 || smoothness <= 0.0 {
+        return;
+    }
+
+    let mut kernel_size = ((values.len() as f64 * 0.08 * smoothness).round() as usize).max(3);
+    kernel_size = kernel_size.min(values.len());
+    let smoothed = convolve_same(values, kernel_size);
+    let weight = smoothness * 0.65;
+
+    for (value, smooth) in values.iter_mut().zip(smoothed) {
+        *value = *value * (1.0 - weight) + smooth * weight;
+    }
 }
 
 fn cubic_bezier_point(t: f64, p0: Point, p1: Point, p2: Point, p3: Point) -> Point {
@@ -220,8 +250,14 @@ fn generate_bezier_path<R: Rng>(
     let cp1_perp = side * curve_mag * distance * rng.random_range(0.5..1.2);
     let cp2_perp = side * curve_mag * distance * rng.random_range(0.3..0.8) * sign(rng);
 
-    let p1 = add(add(start, scale(direction, cp1_along)), scale(perp, cp1_perp));
-    let p2 = add(add(start, scale(direction, cp2_along)), scale(perp, cp2_perp));
+    let p1 = add(
+        add(start, scale(direction, cp1_along)),
+        scale(perp, cp1_perp),
+    );
+    let p2 = add(
+        add(start, scale(direction, cp2_along)),
+        scale(perp, cp2_perp),
+    );
 
     (start, p1, p2, end)
 }
@@ -376,7 +412,11 @@ pub fn generate_single<R: Rng>(
     style: &MovementStyle,
     rng: &mut R,
 ) -> Trajectory {
+    let style = style.sanitized();
     let distance = norm(sub(end, start));
+    if !distance.is_finite() {
+        return Trajectory::empty();
+    }
 
     if distance < 1.0 {
         return Trajectory {
@@ -387,12 +427,13 @@ pub fn generate_single<R: Rng>(
         };
     }
 
-    let diagonal = config.diagonal();
-    let duration = fitts_duration(distance, diagonal, style, rng);
-    let n = ((duration * config.sample_rate as f64) as usize).max(6);
+    let diagonal = finite_positive_or(config.diagonal(), 1.0);
+    let sample_rate = config.sample_rate.clamp(1, MAX_SAMPLE_RATE);
+    let duration = fitts_duration(distance, diagonal, &style, rng);
+    let n = ((duration * sample_rate as f64) as usize).max(6);
 
-    let vel_profile = sub_movement_profile(n, style, rng);
-    let (p0, p1, p2, p3) = generate_bezier_path(start, end, distance, diagonal, style, rng);
+    let vel_profile = sub_movement_profile(n, &style, rng);
+    let (p0, p1, p2, p3) = generate_bezier_path(start, end, distance, diagonal, &style, rng);
     let (t_fine, cum_len, total_len) = arc_length_parameterize(p0, p1, p2, p3, 500);
 
     let time_vals = linspace(0.0, duration, n);
@@ -403,8 +444,15 @@ pub fn generate_single<R: Rng>(
     let mut path_x: Vec<f64> = pts.iter().map(|p| p[0]).collect();
     let mut path_y: Vec<f64> = pts.iter().map(|p| p[1]).collect();
 
-    add_overshoot(&mut path_x, &mut path_y, end, distance, style, rng);
-    add_noise(&mut path_x, &mut path_y, &vel_profile, distance, style, rng);
+    add_overshoot(&mut path_x, &mut path_y, end, distance, &style, rng);
+    add_noise(
+        &mut path_x,
+        &mut path_y,
+        &vel_profile,
+        distance,
+        &style,
+        rng,
+    );
     micro_corrections(&mut path_x, &mut path_y, end);
 
     path_x[0] = start[0];
@@ -423,18 +471,8 @@ pub fn generate_single<R: Rng>(
         .map(|&v| v.clamp(0.0, h_max).round() as i32)
         .collect();
 
-    let timestamps: Vec<f64> = linspace(0.0, duration * 1000.0, n)
-        .into_iter()
-        .map(f64::round)
-        .collect();
-
-    let mut velocities = vec![0.0; n];
-    for i in 1..n {
-        let dt = ((timestamps[i] - timestamps[i - 1]) / 1000.0).max(1e-10);
-        let dx = (xs[i] - xs[i - 1]) as f64;
-        let dy = (ys[i] - ys[i - 1]) as f64;
-        velocities[i] = dx.hypot(dy) / dt;
-    }
+    let timestamps = linspace(0.0, duration * 1000.0, n);
+    let velocities = Trajectory::velocities_for(&xs, &ys, &timestamps);
 
     Trajectory {
         x: xs,
@@ -462,16 +500,49 @@ pub fn merge<R: Rng>(
     rng: &mut R,
 ) -> Trajectory {
     let mut out = Trajectory::empty();
-    let mut offset = 0.0;
-    for (i, traj) in trajectories.iter().enumerate() {
-        if i > 0 {
-            offset = out.t.last().copied().unwrap_or(0.0)
-                + rng.random_range(delay_range.clone());
+    let mut has_output = false;
+
+    for traj in trajectories {
+        let traj = traj.recompute_velocities();
+        if traj.is_empty() {
+            continue;
         }
+
+        let offset = if has_output {
+            let last_t = out.t.last().copied().unwrap_or(0.0);
+            let last_t = if last_t.is_finite() { last_t } else { 0.0 };
+            last_t + sample_delay(&delay_range, rng)
+        } else {
+            0.0
+        };
+
         out.x.extend_from_slice(&traj.x);
         out.y.extend_from_slice(&traj.y);
         out.t.extend(traj.t.iter().map(|&t| t + offset));
-        out.v.extend_from_slice(&traj.v);
+        has_output = true;
     }
+
+    out.refresh_velocities();
     out
+}
+
+fn sample_delay<R: Rng>(delay_range: &Range<f64>, rng: &mut R) -> f64 {
+    let start = if delay_range.start.is_finite() {
+        delay_range.start
+    } else {
+        0.0
+    };
+    let end = if delay_range.end.is_finite() {
+        delay_range.end
+    } else {
+        0.0
+    };
+
+    let lo = start.min(end).max(0.0);
+    let hi = start.max(end).max(0.0);
+    if hi > lo {
+        rng.random_range(lo..hi)
+    } else {
+        lo
+    }
 }
