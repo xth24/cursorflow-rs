@@ -1,13 +1,15 @@
 [package]
 name = "cursorflow"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Generate human-like cursor movement trajectories"
 license = "MIT"
 repository = "https://github.com/xth24/cursorflow-rs"
 readme = "README.md"
 keywords = ["cursor", "mouse", "trajectory", "movement"]
 categories = ["simulation"]
+exclude = ["/assets"]
 
 [dependencies]
 rand = "0.10"

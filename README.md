@@ -7,7 +7,9 @@
 
 Generate human like cursor movement trajectories in Rust.
 
-`cursorflow` creates timestamped cursor paths between points, including velocity profiles, curved movement, small corrections, noise, and optional pauses between segments.
+`cursorflow` creates timestamped cursor paths between points that move the way a hand on a mouse does: a fast, curved primary movement that lands near the target, a brief pause, and one or more small corrections that home in on it. Speed follows an asymmetric bell curve, the path carries a little tremor, and timestamps jitter like real input events. Every draw comes from the `Rng` you pass in, so seeded output is reproducible.
+
+![Cursor moving through five waypoints in real time, with a live speed graph underneath](https://raw.githubusercontent.com/xth24/cursorflow-rs/main/assets/trajectory.gif)
 
 ## Installation
 
@@ -19,14 +21,16 @@ Or add it manually:
 
 ```toml
 [dependencies]
-cursorflow = "0.1"
+cursorflow = "0.2"
 rand = "0.10"
 ```
+
+The `rand` crate is also available as `cursorflow::rand`, so the versions always match.
 
 ## Usage
 
 ```rust
-use cursorflow::{generate, merge, MovementStyle, ScreenConfig};
+use cursorflow::{MovementStyle, ScreenConfig, generate, merge};
 
 fn main() {
     let config = ScreenConfig::default();
@@ -39,13 +43,13 @@ fn main() {
         [1750.0, 200.0],
     ];
 
-    let trajectories = generate(&waypoints, &config, &style, &mut rng);
-    let combined = merge(&trajectories, 70.0..200.0, &mut rng).deduplicate();
+    let segments = generate(&waypoints, &config, &style, &mut rng);
+    let path = merge(&segments, 70.0..200.0, &mut rng).deduplicate();
 
-    for i in 0..combined.len().min(5) {
+    for sample in path.iter().take(5) {
         println!(
-            "x={} y={} t={}ms v={:.0}px/s",
-            combined.x[i], combined.y[i], combined.t[i], combined.v[i]
+            "x={} y={} t={:.1}ms v={:.0}px/s",
+            sample.x, sample.y, sample.t, sample.v
         );
     }
 }
@@ -53,10 +57,19 @@ fn main() {
 
 ## API
 
-- `generate_single(start, end, config, style, rng)` creates one movement.
-- `generate(waypoints, config, style, rng)` creates one movement per waypoint pair.
-- `merge(trajectories, delay_range, rng)` combines multiple movements with random delays.
-- `Trajectory` contains `x`, `y`, `t`, and `v` vectors for coordinates, timestamps, and velocity.
+- `generate_single(start, end, &config, &style, &mut rng)` creates one movement.
+- `generate(&waypoints, &config, &style, &mut rng)` creates one movement per consecutive waypoint pair.
+- `merge(&trajectories, delay_range, &mut rng)` joins movements on one time axis with random pauses, in milliseconds.
+- `ScreenConfig` sets the screen size, sample rate, and timestamp jitter.
+- `MovementStyle` describes the person: speed, precision, nervousness, overshoot tendency, number of movement phases, and smoothness. `MovementStyle::random` draws a persona.
+- `Trajectory` holds `x`, `y`, `t` (milliseconds), and `v` (pixels per second) columns. `iter()` yields `Sample`s, `deduplicate()` drops repeated positions, and `duration()` returns the last timestamp.
+
+Full documentation is on [docs.rs](https://docs.rs/cursorflow).
+
+## Examples
+
+- `cargo run --example trajectory_svg` writes `target/trajectory.svg`: the path colored by speed with a speed graph underneath.
+- `cargo run --example trajectory_video -- target/trajectory.mp4` writes a real time animation with a live speed graph. Requires `ffmpeg`; a `.gif` path works too, which is how the animation above was made.
 
 ## License
 
