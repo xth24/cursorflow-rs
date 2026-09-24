@@ -1,5 +1,7 @@
 //! Screen and sampling parameters.
 
+use crate::curve::Point;
+
 /// Sample rate used by [`ScreenConfig::default`], in hertz.
 const DEFAULT_SAMPLE_RATE: u32 = 120;
 
@@ -68,8 +70,7 @@ impl ScreenConfig {
 
     /// Returns the screen diagonal in pixels.
     ///
-    /// Movement durations scale with distance relative to this diagonal, so
-    /// the same waypoints take longer on a small screen than on a large one.
+    /// Paths bow more the larger the share of this diagonal they cross.
     ///
     /// # Examples
     ///
@@ -82,6 +83,18 @@ impl ScreenConfig {
     /// ```
     pub fn diagonal(&self) -> f64 {
         f64::from(self.width).hypot(f64::from(self.height))
+    }
+
+    /// Returns the largest pixel coordinates on screen, `[width - 1, height - 1]`.
+    pub(crate) fn limits(&self) -> Point {
+        [self.width, self.height].map(|size| f64::from(size.saturating_sub(1)))
+    }
+
+    /// Returns the point on screen nearest `point`.
+    pub(crate) fn clamp(&self, point: Point) -> Point {
+        let [x_max, y_max] = self.limits();
+
+        [point[0].clamp(0.0, x_max), point[1].clamp(0.0, y_max)]
     }
 
     pub(crate) fn sanitized(self) -> Self {

@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::fs;
 
 use cursorflow::rand::{SeedableRng, rngs::SmallRng};
-use cursorflow::{MovementStyle, Point, ScreenConfig, Trajectory, generate, merge};
+use cursorflow::{MovementStyle, Point, ScreenConfig, Target, Trajectory, generate, merge};
 
 const OUTPUT: &str = "target/trajectory.svg";
 const GRID_STEP: u32 = 120;
@@ -17,18 +17,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = ScreenConfig::default();
     let mut rng = SmallRng::seed_from_u64(7);
     let style = MovementStyle::random(&mut rng);
-    let waypoints = [
-        [100.0, 100.0],
-        [900.0, 700.0],
-        [1750.0, 200.0],
-        [400.0, 900.0],
-        [1500.0, 500.0],
+    let start = [100.0, 100.0];
+    let targets = [
+        Target::new([900.0, 700.0], [160.0, 48.0]),
+        Target::new([1750.0, 200.0], [40.0, 40.0]),
+        Target::new([400.0, 900.0], [96.0, 32.0]),
+        Target::new([1500.0, 500.0], [24.0, 24.0]),
     ];
 
-    let segments = generate(&waypoints, &config, &style, &mut rng);
+    let segments = generate(start, targets, &config, &style, &mut rng);
     let trajectory = merge(&segments, 70.0..200.0, &mut rng).deduplicate();
 
-    fs::write(OUTPUT, render(&trajectory, &waypoints, &config)?)?;
+    fs::write(OUTPUT, render(&trajectory, start, &targets, &config)?)?;
     println!("wrote {OUTPUT}");
 
     Ok(())
@@ -36,7 +36,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn render(
     trajectory: &Trajectory,
-    waypoints: &[Point],
+    start: Point,
+    targets: &[Target],
     config: &ScreenConfig,
 ) -> Result<String, Box<dyn Error>> {
     let width = config.width;
@@ -101,12 +102,23 @@ fn render(
     }
     writeln!(svg, "</g>")?;
 
-    for [x, y] in waypoints {
+    for Target {
+        center: [x, y],
+        size: [box_width, box_height],
+    } in targets
+    {
         writeln!(
             svg,
-            r##"<circle cx="{x:.0}" cy="{y:.0}" r="13" fill="#f8fafc" stroke="#101418" stroke-width="4"/>"##
+            r##"<rect x="{:.1}" y="{:.1}" width="{box_width:.1}" height="{box_height:.1}" rx="4" fill="#f8fafc" fill-opacity="0.1" stroke="#f8fafc" stroke-width="3"/>"##,
+            x - box_width / 2.0,
+            y - box_height / 2.0,
         )?;
     }
+    writeln!(
+        svg,
+        r##"<circle cx="{:.0}" cy="{:.0}" r="13" fill="#f8fafc" stroke="#101418" stroke-width="4"/>"##,
+        start[0], start[1]
+    )?;
 
     let baseline = f64::from(height) - GRAPH_MARGIN;
     let graph_span = f64::from(GRAPH_HEIGHT) - 2.0 * GRAPH_MARGIN;

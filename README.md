@@ -7,9 +7,9 @@
 
 Generate human like cursor movement trajectories in Rust.
 
-`cursorflow` creates timestamped cursor paths between points that move the way a hand on a mouse does: a fast, curved primary movement that lands near the target, a brief pause, and one or more small corrections that home in on it. Speed follows an asymmetric bell curve, the path carries a little tremor, and timestamps jitter like real input events. Every draw comes from the `Rng` you pass in, so seeded output is reproducible.
+`cursorflow` creates timestamped cursor paths onto targets on screen that move the way a hand on a mouse does: a fast, curved primary movement aimed at the target and, when it misses, small corrections that either pause briefly or blend into its end until the cursor rests inside the target. Movement time follows Fitts's law, so small and distant targets take longer; landing errors grow with speed; speed follows an asymmetric bell curve; the path carries wobble and tremor that freeze while the hand rests; and timestamps jitter like real input events. Every draw comes from the `Rng` you pass in, so seeded output is reproducible.
 
-![Cursor moving through five waypoints in real time, with a live speed graph underneath](https://raw.githubusercontent.com/xth24/cursorflow-rs/main/assets/trajectory.gif)
+![Cursor moving onto four targets in real time, with a live speed graph underneath](https://raw.githubusercontent.com/xth24/cursorflow-rs/main/assets/trajectory.gif)
 
 ## Installation
 
@@ -21,7 +21,7 @@ Or add it manually:
 
 ```toml
 [dependencies]
-cursorflow = "0.2"
+cursorflow = "0.3"
 rand = "0.10"
 ```
 
@@ -30,20 +30,19 @@ The `rand` crate is also available as `cursorflow::rand`, so the versions always
 ## Usage
 
 ```rust
-use cursorflow::{MovementStyle, ScreenConfig, generate, merge};
+use cursorflow::{MovementStyle, ScreenConfig, Target, generate, merge};
 
 fn main() {
     let config = ScreenConfig::default();
     let mut rng = rand::rng();
     let style = MovementStyle::random(&mut rng);
 
-    let waypoints = [
-        [100.0, 100.0],
-        [900.0, 700.0],
-        [1750.0, 200.0],
+    let targets = [
+        Target::new([900.0, 700.0], [120.0, 40.0]),
+        Target::new([1750.0, 200.0], [32.0, 32.0]),
     ];
 
-    let segments = generate(&waypoints, &config, &style, &mut rng);
+    let segments = generate([100.0, 100.0], targets, &config, &style, &mut rng);
     let path = merge(&segments, 70.0..200.0, &mut rng).deduplicate();
 
     for sample in path.iter().take(5) {
@@ -57,11 +56,12 @@ fn main() {
 
 ## API
 
-- `generate_single(start, end, &config, &style, &mut rng)` creates one movement.
-- `generate(&waypoints, &config, &style, &mut rng)` creates one movement per consecutive waypoint pair.
+- `generate_single(start, target, &config, &style, &mut rng)` creates one movement that comes to rest inside `target`.
+- `generate(start, targets, &config, &style, &mut rng)` creates one movement per target, each starting where the previous one rested.
 - `merge(&trajectories, delay_range, &mut rng)` joins movements on one time axis with random pauses, in milliseconds.
+- `Target` is the rectangle a movement aims at: `Target::new(center, [width, height])`, or `Target::point(center)` for one exact pixel.
 - `ScreenConfig` sets the screen size, sample rate, and timestamp jitter.
-- `MovementStyle` describes the person: speed, precision, nervousness, overshoot tendency, number of movement phases, and smoothness. `MovementStyle::random` draws a persona.
+- `MovementStyle` describes the person: speed, precision, nervousness, overshoot chance, maximum number of movement phases, smoothness, and the direction in which their paths bow. `MovementStyle::random` draws a persona.
 - `Trajectory` holds `x`, `y`, `t` (milliseconds), and `v` (pixels per second) columns. `iter()` yields `Sample`s, `deduplicate()` drops repeated positions, and `duration()` returns the last timestamp.
 
 Full documentation is on [docs.rs](https://docs.rs/cursorflow).

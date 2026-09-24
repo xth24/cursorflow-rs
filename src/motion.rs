@@ -1,102 +1,116 @@
-//! Movement planning: phase timing, landing errors, and speed profiles.
+//! Movement planning: submovement timing, landing errors, and speed profiles.
 
 use std::f64::consts::PI;
 use std::ops::Range;
 
 use rand::{Rng, RngExt};
 
+use crate::config::ScreenConfig;
 use crate::curve::{self, Curve, Point};
-use crate::noise::normal;
+use crate::noise::{normal, normal_quantile};
 use crate::style::MovementStyle;
+use crate::target::Area;
 
-/// Fitts's law intercept in seconds.
-const FITTS_INTERCEPT: f64 = 0.18;
+/// Fitts's law intercept and slope of the primary movement, in seconds and
+/// seconds per bit of the index of difficulty `log2(distance / width + 1)`.
+const PRIMARY_INTERCEPT: f64 = 0.16;
+const PRIMARY_SLOPE: f64 = 0.15;
 
-/// Fitts's law slope in seconds per bit of difficulty.
-const FITTS_SLOPE: f64 = 0.38;
+/// Fitts's law intercept and slope of a corrective movement, in seconds and
+/// seconds per bit.
+const CORRECTION_INTERCEPT: f64 = 0.08;
+const CORRECTION_SLOPE: f64 = 0.05;
 
-/// Converts distance relative to the screen diagonal into an index of
-/// difficulty; `12` makes a move across the full diagonal worth about 3.7 bits.
-const FITTS_GAIN: f64 = 12.0;
-
-/// Bounds on the primary movement's duration in seconds, after style scaling.
+/// Bounds on any movement's duration in seconds, after style scaling.
 const MIN_DURATION: f64 = 0.06;
 const MAX_DURATION: f64 = 2.0;
 
 /// Longest a single correction may take, in seconds.
 const MAX_CORRECTION_DURATION: f64 = 0.6;
 
-/// Endpoint spread of the primary movement as a fraction of its distance,
-/// before precision and speed adjustments.
-const LANDING_SPREAD: f64 = 0.04;
+/// Standard deviation of the logarithm of a movement's duration around its
+/// Fitts's law value, which skews durations long the way human ones are.
+const DURATION_SPREAD: f64 = 0.1;
+
+/// Endpoint spread along the movement axis per unit of average speed, in
+/// seconds: a movement covering `d` pixels in `t` seconds lands with a
+/// standard deviation of this times `d / t`, as in Meyer's optimized
+/// submovement model, so a faster movement misses by more.
+const SPREAD_PER_SPEED: f64 = 0.033;
 
 /// Sideways landing spread relative to the spread along the movement axis.
 const LATERAL_SPREAD: f64 = 0.45;
 
-/// Overshoot tendency at which the landing bias along the movement axis is zero.
-const NEUTRAL_OVERSHOOT: f64 = 0.35;
+/// Bounds on the overshoot chance, which keep its normal quantile finite.
+const MIN_OVERSHOOT: f64 = 0.001;
+const MAX_OVERSHOOT: f64 = 0.999;
 
-/// Landing bias, in spread units, per unit of overshoot tendency above neutral.
-const OVERSHOOT_GAIN: f64 = 1.4;
+/// Draws of the last allowed landing that may miss the target before the
+/// landing is pulled onto the target's nearest point.
+const LANDING_ATTEMPTS: usize = 8;
 
-/// Errors below this many pixels vanish when rounding, so they go uncorrected.
-const MIN_CORRECTION: f64 = 1.0;
+/// Chance that a correction starts while the previous movement is still slowing down.
+const OVERLAP_CHANCE: f64 = 0.5;
 
-/// Share of the Fitts duration taken by the primary movement when corrections follow.
-const PRIMARY_SHARE: Range<f64> = 0.62..0.78;
+/// Head start of an overlapping correction, as a fraction of the previous
+/// movement's duration.
+const OVERLAP: Range<f64> = 0.1..0.3;
 
-/// Pause before a correction in seconds, modelling the visual feedback delay.
-const DWELL: Range<f64> = 0.04..0.15;
+/// Median pause in seconds before a correction that waits for the cursor to
+/// stop, modeling the visual feedback delay, and the standard deviation of
+/// its logarithm.
+const PAUSE_MEDIAN: f64 = 0.085;
+const PAUSE_SPREAD: f64 = 0.4;
+
+/// Bounds on that pause in seconds.
+const MIN_PAUSE: f64 = 0.02;
+const MAX_PAUSE: f64 = 0.4;
 
 /// Pause factor when a correction reverses direction: an overshoot is noticed
 /// while still moving, so the reaction comes sooner.
-const REVERSAL_DWELL: f64 = 0.5;
+const REVERSAL_PAUSE: f64 = 0.5;
 
-/// The fixed part and the part per bit of a correction's duration, in seconds.
-const CORRECTION_INTERCEPT: f64 = 0.07;
-const CORRECTION_SLOPE: f64 = 0.04;
-
-/// Pixels of error that count as one bit of correction difficulty.
-const CORRECTION_SCALE: f64 = 3.0;
-
-/// Error left after a correction as a fraction of the error it targeted;
-/// negative values fall short, which is the more common outcome.
-const RESIDUAL_ALONG: Range<f64> = -0.25..0.12;
-const RESIDUAL_LATERAL: f64 = 0.08;
-
-/// Exponent ranges for the time warp. Values below one move the velocity
-/// peak earlier; the primary range puts it between 36% and 46% of the move.
-const PRIMARY_GAMMA: Range<f64> = 0.72..0.92;
-const CORRECTION_GAMMA: Range<f64> = 0.86..1.0;
+/// Skew ranges of the Beta speed profile, whose velocity peaks at
+/// `2 / (skew + 1)` of the movement: between 36% and 46% for the primary
+/// movement and between 43% and 50% for corrections.
+const PRIMARY_SKEW: Range<f64> = 3.35..4.56;
+const CORRECTION_SKEW: Range<f64> = 3.0..3.7;
 
 /// Speed modulation amplitude at zero jerk smoothness. It must stay below
 /// `1 / (3π)` so the progress function remains monotonic.
 const MAX_WOBBLE: f64 = 0.08;
 
-/// Sideways bulge of the primary curve as a fraction of distance, chosen by
-/// how far the move reaches relative to the screen diagonal.
-const SHORT_CURVE: Range<f64> = 0.02..0.06;
-const MEDIUM_CURVE: Range<f64> = 0.04..0.12;
-const LONG_CURVE: Range<f64> = 0.06..0.18;
+/// Bow of the primary curve as a fraction of distance, chosen by how far the
+/// move reaches relative to the screen diagonal.
+const SHORT_CURVE: Range<f64> = 0.03..0.10;
+const MEDIUM_CURVE: Range<f64> = 0.06..0.20;
+const LONG_CURVE: Range<f64> = 0.10..0.28;
 const SHORT_REACH: f64 = 0.08;
 const MEDIUM_REACH: f64 = 0.25;
 
-/// Sideways bulge of a correction as a fraction of its length.
-const CORRECTION_CURVE: Range<f64> = 0.02..0.10;
+/// Bow of a correction as a fraction of its length.
+const CORRECTION_CURVE: Range<f64> = 0.03..0.15;
+
+/// Share of a curve's bow set by the person's arc direction; the rest varies
+/// from one movement to the next.
+const ARC_CONSISTENCY: f64 = 0.7;
+
+/// Largest bow as a fraction of distance, so a very low precision cannot loop.
+const MAX_BOW: f64 = 0.3;
 
 /// Maps normalized time to the fraction of a path covered.
 #[derive(Debug, Clone)]
 struct Profile {
-    gamma: f64,
+    skew: f64,
     wobble: [f64; 3],
 }
 
 impl Profile {
-    fn random<R: Rng>(gamma: Range<f64>, irregularity: f64, rng: &mut R) -> Self {
+    fn random<R: Rng>(skew: Range<f64>, irregularity: f64, rng: &mut R) -> Self {
         let amplitude = MAX_WOBBLE * irregularity.clamp(0.0, 1.0);
 
         Self {
-            gamma: rng.random_range(gamma),
+            skew: rng.random_range(skew),
             wobble: std::array::from_fn(|_| amplitude * rng.random_range(-1.0..1.0)),
         }
     }
@@ -109,122 +123,118 @@ impl Profile {
             .zip(1..)
             .map(|(&amplitude, k)| amplitude * (f64::from(k) * PI * tau).sin() / f64::from(k))
             .sum();
-        let warped = (tau + wobble).clamp(0.0, 1.0).powf(self.gamma);
 
-        minimum_jerk(warped)
+        beta_progress((tau + wobble).clamp(0.0, 1.0), self.skew)
     }
 }
 
-fn minimum_jerk(x: f64) -> f64 {
-    x * x * x * (10.0 + x * (6.0 * x - 15.0))
+/// Returns the regularized incomplete beta function `I_x(3, b)`, the progress
+/// of a movement whose speed follows the Beta(3, b) density.
+///
+/// At `b = 3` this is the minimum jerk polynomial. Larger `b` keeps its smooth
+/// start and moves the speed peak earlier, to `2 / (b + 1)`.
+fn beta_progress(x: f64, b: f64) -> f64 {
+    1.0 - (1.0 - x).powf(b) * (1.0 + b * x + 0.5 * b * (b + 1.0) * x * x)
 }
 
+/// One submovement: a curve walked with a speed profile from `start` seconds.
 #[derive(Debug, Clone)]
-enum Motion {
-    Hold(Point),
-    Move { curve: Curve, profile: Profile },
-}
-
-#[derive(Debug, Clone)]
-struct Phase {
+struct Stroke {
     start: f64,
     duration: f64,
-    motion: Motion,
+    heading: Point,
+    curve: Curve,
+    profile: Profile,
 }
 
-impl Phase {
-    fn position(&self, time: f64) -> Point {
-        match &self.motion {
-            Motion::Hold(point) => *point,
-            Motion::Move { curve, profile } => {
-                curve.at_fraction(profile.progress((time - self.start) / self.duration))
-            }
-        }
+impl Stroke {
+    /// Returns how far the stroke has carried the cursor by `time` seconds.
+    fn displacement(&self, time: f64) -> Point {
+        let fraction = self.profile.progress((time - self.start) / self.duration);
+
+        curve::sub(self.curve.at_fraction(fraction), self.curve.start())
     }
 
-    fn end(&self) -> Point {
-        match &self.motion {
-            Motion::Hold(point) => *point,
-            Motion::Move { curve, .. } => curve.end(),
-        }
+    fn end(&self) -> f64 {
+        self.start + self.duration
     }
 }
 
-/// The phases of one aimed movement laid out on a shared time axis, in seconds.
+/// The submovements of one aimed movement on a shared time axis, in seconds.
+///
+/// Each correction adds its displacement to the ones before it, so one that
+/// starts early blends into the slowing movement instead of waiting for it to
+/// stop, and the cursor still comes to rest exactly on the last landing.
 #[derive(Debug, Clone)]
 pub(crate) struct Plan {
-    phases: Vec<Phase>,
+    origin: Point,
+    strokes: Vec<Stroke>,
+    landing: Point,
     duration: f64,
 }
 
 impl Plan {
+    /// Plans a movement from `start` that comes to rest inside `area`.
+    ///
+    /// Each phase aims at the target and lands with an error that grows with
+    /// its speed. While the cursor is outside the area and phases remain, a
+    /// correction follows, and the last allowed phase lands inside the area.
     pub(crate) fn new<R: Rng>(
         start: Point,
-        end: Point,
-        diagonal: f64,
+        area: &Area,
+        config: &ScreenConfig,
         style: &MovementStyle,
         rng: &mut R,
     ) -> Self {
-        let distance = curve::norm(curve::sub(end, start));
-        let corrections = style.sub_movement_count.saturating_sub(1);
+        let diagonal = config.diagonal().max(1.0);
         let irregularity = 1.0 - style.jerk_smoothness;
-        let landing = if corrections > 0 {
-            landing_error(start, end, style, rng)
-        } else {
-            [0.0, 0.0]
-        };
-        let corrected = curve::norm(landing) >= MIN_CORRECTION;
-        let landing = if corrected { landing } else { [0.0, 0.0] };
-        let duration = fitts_duration(distance, diagonal, style, rng);
-        let duration = if corrected {
-            duration * rng.random_range(PRIMARY_SHARE)
-        } else {
-            duration
-        };
-        let curvature = primary_curvature(distance / diagonal, style, rng);
-
         let mut plan = Self {
-            phases: Vec::new(),
+            origin: start,
+            strokes: Vec::new(),
+            landing: start,
             duration: 0.0,
         };
-        plan.push_move(
-            Curve::between(start, curve::add(end, landing), curvature, rng),
-            Profile::random(PRIMARY_GAMMA, irregularity, rng),
-            duration,
-        );
 
-        let mut heading = curve::direction(start, end);
-        for index in 0..corrections {
-            let from = plan.end();
-            let remaining = curve::sub(end, from);
-            let gap = curve::norm(remaining);
-
-            if gap < MIN_CORRECTION {
+        for phase in 0..style.sub_movement_count {
+            if area.contains(plan.landing) {
                 break;
             }
 
-            let residual = if index + 1 == corrections {
-                [0.0, 0.0]
-            } else {
-                residual_error(remaining, style, rng)
+            let from = plan.landing;
+            let aim = area.aim();
+            let heading = curve::direction(from, aim);
+            let distance = curve::norm(curve::sub(aim, from));
+            let bits = (distance / area.width_along(heading) + 1.0).log2();
+            let previous = plan.strokes.last();
+            let (duration, skew, curvature) = match previous {
+                None => (
+                    primary_duration(bits, style, rng),
+                    PRIMARY_SKEW,
+                    primary_curvature(distance / diagonal),
+                ),
+                Some(_) => (
+                    correction_duration(bits, style, rng),
+                    CORRECTION_SKEW,
+                    CORRECTION_CURVE,
+                ),
             };
-            let target = curve::add(end, residual);
-            let next = curve::direction(from, target);
-            let dwell = rng.random_range(DWELL) / style.speed_factor.sqrt();
-            let dwell = if curve::dot(heading, next) < 0.0 {
-                dwell * REVERSAL_DWELL
+            let onset = previous.map_or(0.0, |previous| {
+                correction_onset(previous, heading, style, rng)
+            });
+            let landing = if phase + 1 == style.sub_movement_count {
+                land_inside(from, area, duration, style, rng)
             } else {
-                dwell
+                config.clamp(land(from, aim, duration, style, rng))
             };
-            let curvature = rng.random_range(CORRECTION_CURVE) / style.precision;
+            let bow = bow(heading, curvature, style, rng);
 
-            plan.push_hold(from, dwell);
-            plan.push_move(
-                Curve::between(from, target, curvature, rng),
-                Profile::random(CORRECTION_GAMMA, irregularity, rng),
-                correction_duration(gap, style, rng),
-            );
-            heading = next;
+            plan.push(Stroke {
+                start: onset,
+                duration,
+                heading,
+                curve: Curve::bowed(from, landing, bow, rng),
+                profile: Profile::random(skew, irregularity, rng),
+            });
         }
 
         plan
@@ -234,98 +244,135 @@ impl Plan {
         self.duration
     }
 
-    /// Returns the planned position at `time` seconds, holding the endpoints
-    /// outside the planned span.
+    /// Returns the point the cursor comes to rest on.
+    pub(crate) fn landing(&self) -> Point {
+        self.landing
+    }
+
+    /// Returns the planned position at `time` seconds: the start plus how far
+    /// every submovement has carried the cursor by then.
     pub(crate) fn position(&self, time: f64) -> Point {
-        let phase = self
-            .phases
-            .iter()
-            .rev()
-            .find(|phase| time >= phase.start)
-            .or_else(|| self.phases.first());
-
-        phase.map_or([0.0, 0.0], |phase| phase.position(time))
+        self.strokes.iter().fold(self.origin, |point, stroke| {
+            curve::add(point, stroke.displacement(time))
+        })
     }
 
-    fn end(&self) -> Point {
-        self.phases.last().map_or([0.0, 0.0], Phase::end)
-    }
-
-    fn push_move(&mut self, curve: Curve, profile: Profile, duration: f64) {
-        self.push(Motion::Move { curve, profile }, duration);
-    }
-
-    fn push_hold(&mut self, point: Point, duration: f64) {
-        self.push(Motion::Hold(point), duration);
-    }
-
-    fn push(&mut self, motion: Motion, duration: f64) {
-        self.phases.push(Phase {
-            start: self.duration,
-            duration,
-            motion,
-        });
-        self.duration += duration;
+    fn push(&mut self, stroke: Stroke) {
+        self.duration = self.duration.max(stroke.end());
+        self.landing = stroke.curve.end();
+        self.strokes.push(stroke);
     }
 }
 
-fn fitts_duration<R: Rng>(distance: f64, diagonal: f64, style: &MovementStyle, rng: &mut R) -> f64 {
-    let reach = if distance.is_finite() && diagonal > 0.0 {
-        (distance / diagonal).max(0.0)
-    } else {
-        0.0
-    };
-    let intercept = FITTS_INTERCEPT + rng.random_range(-0.02..0.02);
-    let slope = FITTS_SLOPE + rng.random_range(-0.03..0.03);
-    let duration = (intercept + slope * (1.0 + FITTS_GAIN * reach).log2()) / style.speed_factor;
+fn primary_duration<R: Rng>(bits: f64, style: &MovementStyle, rng: &mut R) -> f64 {
+    let duration = (PRIMARY_INTERCEPT + PRIMARY_SLOPE * bits) / style.speed_factor;
 
-    (duration * rng.random_range(0.92..1.08)).clamp(MIN_DURATION, MAX_DURATION)
+    (duration * duration_jitter(rng)).clamp(MIN_DURATION, MAX_DURATION)
 }
 
-fn correction_duration<R: Rng>(gap: f64, style: &MovementStyle, rng: &mut R) -> f64 {
-    let bits = (1.0 + gap / CORRECTION_SCALE).log2();
+fn correction_duration<R: Rng>(bits: f64, style: &MovementStyle, rng: &mut R) -> f64 {
     let duration = (CORRECTION_INTERCEPT + CORRECTION_SLOPE * bits) / style.speed_factor;
 
-    (duration * rng.random_range(0.9..1.1)).clamp(MIN_DURATION, MAX_CORRECTION_DURATION)
+    (duration * duration_jitter(rng)).clamp(MIN_DURATION, MAX_CORRECTION_DURATION)
 }
 
-fn primary_curvature<R: Rng>(reach: f64, style: &MovementStyle, rng: &mut R) -> f64 {
-    let range = if reach < SHORT_REACH {
+fn duration_jitter<R: Rng>(rng: &mut R) -> f64 {
+    (DURATION_SPREAD * normal(rng)).exp()
+}
+
+/// Returns when a correction heading along `heading` starts, in seconds.
+///
+/// It either starts while `previous` is still slowing down, blending into it,
+/// or waits a skewed pause after the cursor stops, a shorter one when it
+/// reverses direction.
+fn correction_onset<R: Rng>(
+    previous: &Stroke,
+    heading: Point,
+    style: &MovementStyle,
+    rng: &mut R,
+) -> f64 {
+    if rng.random_bool(OVERLAP_CHANCE) {
+        return previous.end() - rng.random_range(OVERLAP) * previous.duration;
+    }
+
+    let pause = PAUSE_MEDIAN * (PAUSE_SPREAD * normal(rng)).exp() / style.speed_factor.sqrt();
+    let pause = if curve::dot(previous.heading, heading) < 0.0 {
+        pause * REVERSAL_PAUSE
+    } else {
+        pause
+    };
+
+    previous.end() + pause.clamp(MIN_PAUSE, MAX_PAUSE)
+}
+
+/// Draws where a movement from `from` aimed at `aim` lands after `duration` seconds.
+///
+/// The error along the movement axis is shifted so that the style's
+/// overshoot chance is the probability of landing beyond `aim`.
+fn land<R: Rng>(
+    from: Point,
+    aim: Point,
+    duration: f64,
+    style: &MovementStyle,
+    rng: &mut R,
+) -> Point {
+    let heading = curve::direction(from, aim);
+    let distance = curve::norm(curve::sub(aim, from));
+    let spread = SPREAD_PER_SPEED * distance / duration / style.precision;
+    let bias = normal_quantile(style.overshoot_tendency.clamp(MIN_OVERSHOOT, MAX_OVERSHOOT));
+    let along = spread * (normal(rng) + bias);
+    let lateral = spread * LATERAL_SPREAD * normal(rng);
+
+    curve::add(
+        aim,
+        curve::add(
+            curve::scale(heading, along),
+            curve::scale(curve::perpendicular(heading), lateral),
+        ),
+    )
+}
+
+/// Draws the landing of the last allowed movement, which ends inside `area`.
+fn land_inside<R: Rng>(
+    from: Point,
+    area: &Area,
+    duration: f64,
+    style: &MovementStyle,
+    rng: &mut R,
+) -> Point {
+    let mut landing = land(from, area.aim(), duration, style, rng);
+
+    for _ in 1..LANDING_ATTEMPTS {
+        if area.contains(landing) {
+            return landing;
+        }
+
+        landing = land(from, area.aim(), duration, style, rng);
+    }
+
+    area.clamp(landing)
+}
+
+fn primary_curvature(reach: f64) -> Range<f64> {
+    if reach < SHORT_REACH {
         SHORT_CURVE
     } else if reach < MEDIUM_REACH {
         MEDIUM_CURVE
     } else {
         LONG_CURVE
-    };
-
-    rng.random_range(range) / style.precision
+    }
 }
 
-fn landing_error<R: Rng>(start: Point, end: Point, style: &MovementStyle, rng: &mut R) -> Point {
-    let distance = curve::norm(curve::sub(end, start));
-    let spread = distance * LANDING_SPREAD * style.speed_factor.sqrt() / style.precision;
-    let bias = (style.overshoot_tendency - NEUTRAL_OVERSHOOT) * OVERSHOOT_GAIN;
-    let heading = curve::direction(start, end);
-    let along = spread * (normal(rng) + bias);
-    let lateral = spread * LATERAL_SPREAD * normal(rng);
+/// Draws the signed bow of a curve heading along `heading`, as a fraction of its length.
+///
+/// Most of the bow follows the style's arc direction, so one person bends
+/// movements in a given direction the same way, and the rest varies.
+fn bow<R: Rng>(heading: Point, curvature: Range<f64>, style: &MovementStyle, rng: &mut R) -> f64 {
+    let angle = heading[1].atan2(heading[0]);
+    let side = ARC_CONSISTENCY * (angle - style.arc_direction).cos()
+        + (1.0 - ARC_CONSISTENCY) * rng.random_range(-1.0..1.0);
 
-    curve::add(
-        curve::scale(heading, along),
-        curve::scale(curve::perpendicular(heading), lateral),
-    )
-}
-
-fn residual_error<R: Rng>(remaining: Point, style: &MovementStyle, rng: &mut R) -> Point {
-    let gap = curve::norm(remaining);
-    let heading = curve::scale(remaining, 1.0 / gap);
-    let accuracy = (1.0 / style.precision).clamp(0.5, 2.0);
-    let along = gap * rng.random_range(RESIDUAL_ALONG) * accuracy;
-    let lateral = gap * RESIDUAL_LATERAL * normal(rng) * accuracy;
-
-    curve::add(
-        curve::scale(heading, along),
-        curve::scale(curve::perpendicular(heading), lateral),
-    )
+    (rng.random_range(curvature) / style.precision * side).clamp(-MAX_BOW, MAX_BOW)
 }
 
 #[cfg(test)]
@@ -333,11 +380,60 @@ mod tests {
     use rand::{SeedableRng, rngs::SmallRng};
 
     use super::*;
+    use crate::target::Target;
+
+    fn config() -> ScreenConfig {
+        ScreenConfig::default()
+    }
+
+    fn plan(
+        start: Point,
+        target: Target,
+        style: &MovementStyle,
+        rng: &mut SmallRng,
+    ) -> (Plan, Area) {
+        let area = Area::new(&target, &config());
+
+        (Plan::new(start, &area, &config(), style, rng), area)
+    }
+
+    #[test]
+    fn beta_progress_generalizes_minimum_jerk() {
+        for step in 0..=1000 {
+            let x = f64::from(step) / 1000.0;
+            let minimum_jerk = x * x * x * (10.0 + x * (6.0 * x - 15.0));
+
+            assert!((beta_progress(x, 3.0) - minimum_jerk).abs() < 1e-12);
+        }
+
+        for skew in [PRIMARY_SKEW.start, 4.0, PRIMARY_SKEW.end] {
+            let steps = 10_000;
+            let (peak, _) = (1..=steps)
+                .map(|step| {
+                    let x = f64::from(step) / f64::from(steps);
+                    let before = f64::from(step - 1) / f64::from(steps);
+
+                    (x, beta_progress(x, skew) - beta_progress(before, skew))
+                })
+                .fold((0.0, 0.0), |best, candidate| {
+                    if candidate.1 > best.1 {
+                        candidate
+                    } else {
+                        best
+                    }
+                });
+
+            assert!(
+                (peak - 2.0 / (skew + 1.0)).abs() < 1e-3,
+                "peak at {peak} for skew {skew}"
+            );
+        }
+    }
 
     #[test]
     fn progress_stays_monotonic_at_maximum_irregularity() {
         let profile = Profile {
-            gamma: PRIMARY_GAMMA.start,
+            skew: PRIMARY_SKEW.end,
             wobble: [MAX_WOBBLE, -MAX_WOBBLE, MAX_WOBBLE],
         };
 
@@ -346,7 +442,7 @@ mod tests {
 
         let mut previous = 0.0;
         for step in 1..=2000 {
-            let value = profile.progress(step as f64 / 2000.0);
+            let value = profile.progress(f64::from(step) / 2000.0);
 
             assert!(value >= previous, "progress fell at step {step}");
             previous = value;
@@ -354,48 +450,171 @@ mod tests {
     }
 
     #[test]
-    fn velocity_peaks_before_the_midpoint() {
-        let profile = Profile {
-            gamma: 0.8,
-            wobble: [0.0; 3],
-        };
-        let steps = 1000;
-        let (peak_step, _) = (1..steps)
-            .map(|step| {
-                let before = profile.progress((step - 1) as f64 / steps as f64);
-                let after = profile.progress((step + 1) as f64 / steps as f64);
-                (step, after - before)
-            })
-            .fold((0, 0.0), |best, candidate| {
-                if candidate.1 > best.1 {
-                    candidate
-                } else {
-                    best
-                }
-            });
-        let peak = peak_step as f64 / steps as f64;
-
-        assert!((0.35..0.45).contains(&peak), "peak at {peak}");
-    }
-
-    #[test]
-    fn plan_starts_at_origin_and_ends_on_target() {
+    fn plan_starts_at_origin_and_rests_inside_the_target() {
         let mut rng = SmallRng::seed_from_u64(11);
         let style = MovementStyle {
             sub_movement_count: 4,
             ..MovementStyle::default()
         };
         let start = [100.0, 100.0];
-        let end = [1200.0, 800.0];
-        let plan = Plan::new(start, end, 2203.0, &style, &mut rng);
 
-        assert_eq!(plan.position(0.0), start);
-        assert!(curve::norm(curve::sub(plan.position(plan.duration()), end)) < MIN_CORRECTION);
+        for _ in 0..200 {
+            let (plan, area) = plan(
+                start,
+                Target::new([1200.0, 800.0], [12.0, 12.0]),
+                &style,
+                &mut rng,
+            );
+            let rest = plan.position(plan.duration());
+
+            assert_eq!(plan.position(0.0), start);
+            assert!(curve::norm(curve::sub(rest, plan.landing())) < 1e-9);
+            assert!(area.contains(plan.landing()));
+            assert!((1..=4).contains(&plan.strokes.len()));
+            assert!(plan.duration() > MIN_DURATION);
+        }
+    }
+
+    #[test]
+    fn overlapping_corrections_blend_without_stopping() {
+        let mut rng = SmallRng::seed_from_u64(12);
+        let style = MovementStyle {
+            sub_movement_count: 2,
+            ..MovementStyle::default()
+        };
+        let (mut overlapping, mut blended) = (0, 0);
+
+        for _ in 0..400 {
+            let (plan, _) = plan(
+                [100.0, 500.0],
+                Target::point([900.0, 700.0]),
+                &style,
+                &mut rng,
+            );
+            let [primary, correction] = plan.strokes.as_slice() else {
+                continue;
+            };
+
+            if correction.start >= primary.end()
+                || curve::dot(primary.heading, correction.heading) < 0.0
+            {
+                continue;
+            }
+
+            let speed = |time: f64| {
+                curve::norm(curve::sub(
+                    plan.position(time + 1e-3),
+                    plan.position(time - 1e-3),
+                )) / 2e-3
+            };
+            let peak = (0..=200)
+                .map(|step| speed(primary.duration * f64::from(step) / 200.0))
+                .fold(0.0, f64::max);
+            let slowest = (0..=100)
+                .map(|step| {
+                    speed(correction.start + 0.45 * correction.duration * f64::from(step) / 100.0)
+                })
+                .fold(f64::INFINITY, f64::min);
+
+            overlapping += 1;
+            blended += usize::from(slowest > 0.02 * peak);
+        }
+
         assert!(
-            plan.phases.len() >= 3,
-            "expected a correction, got {} phases",
-            plan.phases.len()
+            overlapping > 50,
+            "only {overlapping} overlapping corrections"
         );
-        assert!(plan.duration() > MIN_DURATION);
+        assert!(
+            blended * 10 > overlapping * 8,
+            "{blended} of {overlapping} overlapping corrections kept moving"
+        );
+    }
+
+    #[test]
+    fn overshoot_chance_is_the_style_probability() {
+        let mut rng = SmallRng::seed_from_u64(13);
+        let aim = [1000.0, 540.0];
+
+        for chance in [0.1, 0.3, 0.7] {
+            let style = MovementStyle {
+                overshoot_tendency: chance,
+                sub_movement_count: 2,
+                ..MovementStyle::default()
+            };
+            let trials = 4000;
+            let overshoots = (0..trials)
+                .filter(|_| {
+                    let (plan, _) = plan([200.0, 540.0], Target::point(aim), &style, &mut rng);
+
+                    plan.strokes[0].curve.end()[0] > aim[0]
+                })
+                .count();
+            let observed = overshoots as f64 / f64::from(trials);
+
+            assert!(
+                (observed - chance).abs() < 0.03,
+                "chance {chance}, observed {observed}"
+            );
+        }
+    }
+
+    #[test]
+    fn smaller_targets_take_longer_and_need_more_corrections() {
+        let mut rng = SmallRng::seed_from_u64(14);
+        let style = MovementStyle::default();
+        let summary = |size: f64, rng: &mut SmallRng| {
+            let trials = 600;
+            let (time, corrected) = (0..trials).fold((0.0, 0), |(time, corrected), _| {
+                let (plan, _) = plan(
+                    [300.0, 300.0],
+                    Target::new([900.0, 300.0], [size, size]),
+                    &style,
+                    rng,
+                );
+
+                (
+                    time + plan.duration(),
+                    corrected + usize::from(plan.strokes.len() > 1),
+                )
+            });
+
+            (
+                time / f64::from(trials),
+                corrected as f64 / f64::from(trials),
+            )
+        };
+        let (large_time, large_rate) = summary(200.0, &mut rng);
+        let (medium_time, medium_rate) = summary(30.0, &mut rng);
+        let (small_time, small_rate) = summary(4.0, &mut rng);
+
+        assert!(large_time < medium_time && medium_time < small_time);
+        assert!(large_rate < 0.1, "large target corrected {large_rate}");
+        assert!(large_rate < medium_rate && medium_rate < small_rate);
+        assert!(small_rate > 0.9, "small target corrected {small_rate}");
+    }
+
+    #[test]
+    fn a_person_bows_a_given_direction_the_same_way() {
+        let mut rng = SmallRng::seed_from_u64(15);
+        let style = MovementStyle {
+            arc_direction: 0.0,
+            ..MovementStyle::default()
+        };
+        let rightward = [1.0, 0.0];
+        let downward = [0.0, 1.0];
+        let right_of_travel = (0..1000)
+            .filter(|_| bow(rightward, LONG_CURVE, &style, &mut rng) > 0.0)
+            .count();
+        let across: f64 = (0..1000)
+            .map(|_| bow(downward, LONG_CURVE, &style, &mut rng).abs())
+            .sum::<f64>()
+            / 1000.0;
+        let along: f64 = (0..1000)
+            .map(|_| bow(rightward, LONG_CURVE, &style, &mut rng).abs())
+            .sum::<f64>()
+            / 1000.0;
+
+        assert_eq!(right_of_travel, 1000);
+        assert!(across < 0.3 * along, "across {across}, along {along}");
     }
 }

@@ -17,8 +17,14 @@ const MAX_TABLE: usize = 512;
 /// Pixels of control polygon per arc length table entry.
 const PIXELS_PER_ENTRY: f64 = 2.0;
 
-/// Extra sideways bulge for vertical movements, where the forearm pivots.
-const BIOMECHANICAL_BIAS: f64 = 0.15;
+/// Sideways offset of a control point per unit of its distance along the
+/// chord that larger bows approach but never reach: the tangent of 30°, so a
+/// path never leaves or arrives more than 30° off the straight line to its end.
+const MAX_CONTROL_SLOPE: f64 = 0.58;
+
+/// Chance that the second control point bends back across the chord, giving
+/// an S shaped path instead of a single arc.
+const S_CURVE_CHANCE: f64 = 0.1;
 
 pub(crate) fn add(a: Point, b: Point) -> Point {
     [a[0] + b[0], a[1] + b[1]]
@@ -54,10 +60,6 @@ pub(crate) fn direction(from: Point, to: Point) -> Point {
     } else {
         [1.0, 0.0]
     }
-}
-
-fn random_sign<R: Rng>(rng: &mut R) -> f64 {
-    if rng.random_bool(0.5) { 1.0 } else { -1.0 }
 }
 
 /// Interpolates `fp` linearly over the sorted knots `xp`, clamping at both ends.
@@ -114,26 +116,42 @@ impl Curve {
         }
     }
 
-    /// Builds a curve from `start` to `end` that bulges sideways by about
-    /// `curvature` times the distance, towards a randomly chosen side.
-    pub(crate) fn between<R: Rng>(start: Point, end: Point, curvature: f64, rng: &mut R) -> Self {
+    /// Builds a curve from `start` to `end` that bows sideways by about `bow`
+    /// times the distance: to the right of the direction of travel when `bow`
+    /// is positive and to the left when it is negative, as seen on screen.
+    pub(crate) fn bowed<R: Rng>(start: Point, end: Point, bow: f64, rng: &mut R) -> Self {
         let delta = sub(end, start);
-        let distance = norm(delta);
-        let side = perpendicular(direction(start, end));
-        let angle = delta[1].atan2(delta[0]);
-        let bias = 1.0 + angle.sin() * BIOMECHANICAL_BIAS * rng.random_range(0.5..1.5);
-        let bulge = random_sign(rng) * bias * curvature * distance;
+        let side = scale(perpendicular(direction(start, end)), norm(delta));
+        let first_along = rng.random_range(0.2..0.4);
+        let second_along = rng.random_range(0.6..0.8);
+        let turn = if rng.random_bool(S_CURVE_CHANCE) {
+            -1.0
+        } else {
+            1.0
+        };
+        let first_offset = saturate(
+            bow * rng.random_range(0.5..1.2),
+            MAX_CONTROL_SLOPE * first_along,
+        );
+        let second_offset = saturate(
+            bow * rng.random_range(0.3..0.8) * turn,
+            MAX_CONTROL_SLOPE * (1.0 - second_along),
+        );
 
         let first = add(
-            add(start, scale(delta, rng.random_range(0.2..0.4))),
-            scale(side, bulge * rng.random_range(0.5..1.2)),
+            add(start, scale(delta, first_along)),
+            scale(side, first_offset),
         );
         let second = add(
-            add(start, scale(delta, rng.random_range(0.6..0.8))),
-            scale(side, bulge * rng.random_range(0.3..0.8) * random_sign(rng)),
+            add(start, scale(delta, second_along)),
+            scale(side, second_offset),
         );
 
         Self::new([start, first, second, end])
+    }
+
+    pub(crate) fn start(&self) -> Point {
+        self.control[0]
     }
 
     pub(crate) fn end(&self) -> Point {
@@ -150,6 +168,12 @@ impl Curve {
 
         point_at(self.control, interp(target, &self.lengths, &self.params))
     }
+}
+
+/// Returns `value` squeezed smoothly into `-limit..limit`, nearly unchanged
+/// while it is small against `limit`.
+fn saturate(value: f64, limit: f64) -> f64 {
+    limit * (value / limit).tanh()
 }
 
 fn point_at([p0, p1, p2, p3]: [Point; 4], t: f64) -> Point {
@@ -176,7 +200,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(3);
         let start = [100.0, 100.0];
         let end = [900.0, 400.0];
-        let curve = Curve::between(start, end, 0.15, &mut rng);
+        let curve = Curve::bowed(start, end, 0.15, &mut rng);
 
         assert_eq!(curve.at_fraction(0.0), start);
         assert_eq!(curve.at_fraction(1.0), end);
@@ -194,6 +218,31 @@ mod tests {
         }
 
         assert!((travelled - curve.length()).abs() < 1.0);
+    }
+
+    #[test]
+    fn bow_follows_its_sign_and_heading_stays_bounded() {
+        let mut rng = SmallRng::seed_from_u64(4);
+        let start = [0.0, 0.0];
+        let end = [1000.0, 0.0];
+
+        for bow in [0.1, -0.1, 0.9] {
+            let mut arcs = 0;
+            for _ in 0..500 {
+                let curve = Curve::bowed(start, end, bow, &mut rng);
+                let middle = curve.at_fraction(0.5);
+                let early = curve.at_fraction(0.01);
+                let heading = early[1].atan2(early[0]).abs().to_degrees();
+
+                if middle[1] * bow > 0.0 {
+                    arcs += 1;
+                }
+
+                assert!(heading < 31.0, "heading {heading} for bow {bow}");
+            }
+
+            assert!(arcs > 460, "{arcs} of 500 bowed toward the sign of {bow}");
+        }
     }
 
     #[test]

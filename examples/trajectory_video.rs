@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
 use cursorflow::rand::{SeedableRng, rngs::SmallRng};
-use cursorflow::{MovementStyle, Point, ScreenConfig, Trajectory, generate, merge};
+use cursorflow::{MovementStyle, Point, ScreenConfig, Target, Trajectory, generate, merge};
 
 const VIEW_WIDTH: usize = 960;
 const VIEW_HEIGHT: usize = 540;
@@ -26,7 +26,7 @@ const FUTURE_PATH: [u8; 3] = [54, 72, 84];
 const TRAIL: [u8; 3] = [70, 210, 255];
 const CURSOR: [u8; 3] = [248, 250, 252];
 const OUTLINE: [u8; 3] = [16, 20, 24];
-const WAYPOINT: [u8; 3] = [255, 213, 92];
+const TARGET: [u8; 3] = [255, 213, 92];
 const GRAPH: [u8; 3] = [120, 200, 120];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -39,15 +39,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = ScreenConfig::default();
     let mut rng = SmallRng::seed_from_u64(7);
     let style = MovementStyle::random(&mut rng);
-    let waypoints = [
-        [100.0, 100.0],
-        [900.0, 700.0],
-        [1750.0, 200.0],
-        [400.0, 900.0],
-        [1500.0, 500.0],
+    let start = [100.0, 100.0];
+    let targets = [
+        Target::new([900.0, 700.0], [160.0, 48.0]),
+        Target::new([1750.0, 200.0], [40.0, 40.0]),
+        Target::new([400.0, 900.0], [96.0, 32.0]),
+        Target::new([1500.0, 500.0], [24.0, 24.0]),
     ];
 
-    let segments = generate(&waypoints, &config, &style, &mut rng);
+    let segments = generate(start, targets, &config, &style, &mut rng);
     let trajectory = merge(&segments, 70.0..200.0, &mut rng);
     let frames = ((trajectory.duration() / 1000.0) * f64::from(fps)).ceil() as usize + 1;
 
@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut stdin = child.stdin.take().ok_or("ffmpeg stdin is not piped")?;
     for frame in 0..frames {
         let time_ms = frame as f64 * 1000.0 / f64::from(fps);
-        render_frame(&trajectory, &waypoints, &config, time_ms).write_ppm(&mut stdin)?;
+        render_frame(&trajectory, start, &targets, &config, time_ms).write_ppm(&mut stdin)?;
     }
     drop(stdin);
 
@@ -98,7 +98,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn render_frame(
     trajectory: &Trajectory,
-    waypoints: &[Point],
+    start: Point,
+    targets: &[Target],
     config: &ScreenConfig,
     time_ms: f64,
 ) -> Image {
@@ -111,7 +112,7 @@ fn render_frame(
     draw_trail(
         &mut image, trajectory, config, trail_end, cursor_x, cursor_y,
     );
-    draw_waypoints(&mut image, waypoints, config);
+    draw_targets(&mut image, start, targets, config);
     draw_cursor(&mut image, config, cursor_x, cursor_y);
     draw_graph(&mut image, trajectory, time_ms);
 
@@ -192,13 +193,27 @@ fn draw_trail(
     }
 }
 
-fn draw_waypoints(image: &mut Image, waypoints: &[Point], config: &ScreenConfig) {
-    for &[x, y] in waypoints {
-        let x = map_x(x, config);
-        let y = map_y(y, config);
-        image.draw_disc(x, y, 8, OUTLINE);
-        image.draw_disc(x, y, 5, WAYPOINT);
+fn draw_targets(image: &mut Image, start: Point, targets: &[Target], config: &ScreenConfig) {
+    for Target {
+        center: [x, y],
+        size: [width, height],
+    } in targets
+    {
+        let left = map_x(x - width / 2.0, config);
+        let right = map_x(x + width / 2.0, config);
+        let top = map_y(y - height / 2.0, config);
+        let bottom = map_y(y + height / 2.0, config);
+
+        image.draw_line(left, top, right, top, TARGET, 1);
+        image.draw_line(right, top, right, bottom, TARGET, 1);
+        image.draw_line(right, bottom, left, bottom, TARGET, 1);
+        image.draw_line(left, bottom, left, top, TARGET, 1);
     }
+
+    let x = map_x(start[0], config);
+    let y = map_y(start[1], config);
+    image.draw_disc(x, y, 8, OUTLINE);
+    image.draw_disc(x, y, 5, TARGET);
 }
 
 fn draw_cursor(image: &mut Image, config: &ScreenConfig, x: f64, y: f64) {

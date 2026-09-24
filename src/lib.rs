@@ -1,31 +1,38 @@
 //! Human like cursor movement trajectories.
 //!
-//! `cursorflow` generates timestamped cursor paths between points that move
-//! the way a hand on a mouse does. Each movement is a fast, slightly curved
-//! primary motion that lands near the target, a short pause, and one or more
-//! small corrections that home in on it. Speed follows an asymmetric bell
-//! curve, the path carries a little tremor, and timestamps jitter like real
-//! input events. Everything is drawn from the [`Rng`] you pass in, so a
-//! seeded generator reproduces the same path.
+//! `cursorflow` generates timestamped cursor paths onto targets on screen
+//! that move the way a hand on a mouse does. Each movement is a fast,
+//! slightly curved primary motion aimed at the target. When it misses, small
+//! corrections follow, either after a brief pause or blending into its end,
+//! until the cursor rests inside the target. Movement time follows Fitts's
+//! law, landing errors grow with speed, speed follows an asymmetric bell
+//! curve, the path carries wobble and tremor that freeze while the hand
+//! rests, and timestamps jitter like real input events. Everything is drawn
+//! from the [`Rng`] you pass in, so a seeded generator reproduces the same
+//! path.
 //!
 //! The entry points are [`generate_single`] for one movement, [`generate`]
-//! for a chain of waypoints, and [`merge`] to join the chain on one time
-//! axis. [`ScreenConfig`] describes the screen and sampling, and
-//! [`MovementStyle`] describes the person. The result is a [`Trajectory`].
+//! for a chain of targets, and [`merge`] to join the chain on one time axis.
+//! A [`Target`] is the rectangle a movement aims at, [`ScreenConfig`]
+//! describes the screen and sampling, and [`MovementStyle`] describes the
+//! person. The result is a [`Trajectory`].
 //!
 //! # Examples
 //!
-//! Move through a few waypoints and print the first samples:
+//! Click through a few buttons and print the first samples:
 //!
 //! ```
-//! use cursorflow::{MovementStyle, ScreenConfig, generate, merge};
+//! use cursorflow::{MovementStyle, ScreenConfig, Target, generate, merge};
 //!
 //! let config = ScreenConfig::default();
 //! let mut rng = rand::rng();
 //! let style = MovementStyle::random(&mut rng);
-//! let waypoints = [[100.0, 100.0], [900.0, 700.0], [1750.0, 200.0]];
+//! let targets = [
+//!     Target::new([900.0, 700.0], [120.0, 40.0]),
+//!     Target::new([1750.0, 200.0], [32.0, 32.0]),
+//! ];
 //!
-//! let segments = generate(&waypoints, &config, &style, &mut rng);
+//! let segments = generate([100.0, 100.0], targets, &config, &style, &mut rng);
 //! let path = merge(&segments, 70.0..200.0, &mut rng).deduplicate();
 //!
 //! for sample in path.iter().take(5) {
@@ -37,15 +44,16 @@
 //!
 //! ```
 //! use cursorflow::rand::{SeedableRng, rngs::SmallRng};
-//! use cursorflow::{MovementStyle, ScreenConfig, generate_single};
+//! use cursorflow::{MovementStyle, ScreenConfig, Target, generate_single};
 //!
 //! let config = ScreenConfig::default();
 //! let style = MovementStyle::default();
+//! let target = Target::new([500.0, 300.0], [48.0, 48.0]);
 //! let mut first = SmallRng::seed_from_u64(7);
 //! let mut second = SmallRng::seed_from_u64(7);
 //!
-//! let a = generate_single([0.0, 0.0], [500.0, 300.0], &config, &style, &mut first);
-//! let b = generate_single([0.0, 0.0], [500.0, 300.0], &config, &style, &mut second);
+//! let a = generate_single([0.0, 0.0], target, &config, &style, &mut first);
+//! let b = generate_single([0.0, 0.0], target, &config, &style, &mut second);
 //!
 //! assert_eq!(a, b);
 //! ```
@@ -61,6 +69,7 @@ mod generator;
 mod motion;
 mod noise;
 mod style;
+mod target;
 mod trajectory;
 
 /// The random number generator crate this library builds on, reexported so
@@ -75,5 +84,7 @@ pub use curve::Point;
 pub use generator::{generate, generate_single, merge};
 #[doc(inline)]
 pub use style::MovementStyle;
+#[doc(inline)]
+pub use target::Target;
 #[doc(inline)]
 pub use trajectory::{Iter, Sample, Trajectory};
